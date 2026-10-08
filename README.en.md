@@ -9,7 +9,7 @@ Windows desktop shell, tray guard and boot splash
 | Directory | What it does |
 |---|---|
 | `apps/dsh-desktop` | WebView2 desktop shell, single-file C# source |
-| `dockkit-2axis` | Right-column two-axis docking patch: rows and columns, up to 8 panes, terminal as a bottom row |
+| `dockkit-2axis` | Verification scripts for right-column two-axis docking; the patch itself ships inside dsh-vk-layout |
 | `dsh-tray` | System tray guard for the desktop shell |
 | `dsh-boot-splash` | Boot splash overlay that covers the blank page until the UI paints |
 

@@ -9,7 +9,7 @@ Windows 桌面外壳、托盘守护与启动片头
 | 目录 | 作用 |
 |---|---|
 | `apps/dsh-desktop` | WebView2 桌面外壳（单文件 C# 源码） |
-| `dockkit-2axis` | 右栏两轴分格补丁：行列分格、最多 8 个面板、终端默认落成下分栏 |
+| `dockkit-2axis` | 右栏两轴分格的验证脚本（补丁本体随 dsh-vk-layout 插件走，不再需要单独打） |
 | `dsh-tray` | 桌面外壳的系统托盘守护 |
 | `dsh-boot-splash` | 盖住页面未渲染空白的启动片头层 |
 
