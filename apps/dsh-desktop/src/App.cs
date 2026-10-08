@@ -43,8 +43,6 @@ namespace DshDesktop
         private static readonly string TrayWorkDir = Root + "\\dsh-tray";
         private static readonly string ChangliaoIconPath = Root + "\\assets\\changliao.ico";
         private const string MutexName = "DshDesktop_SingleInstance_3080";
-        private const int ProxyPort = 3081;
-        private static readonly string ProxyScript = Root + "\\scripts\\dsh-wifi-proxy.js";
         private const int SwRestore = 9;
         // 2026-09-29：点 X 只隐藏窗口、外壳进程继续活着，于是需要一条能把隐藏窗口唤回来的路。
         // .NET 的 Process.MainWindowHandle 只认可见窗口，窗口一藏它就返回 0，单实例激活失效 ——
@@ -84,6 +82,25 @@ namespace DshDesktop
         // 最大化时按显示器工作区夹一次：去掉 WS_CAPTION 的窗口默认会铺满整块屏幕（把任务栏盖住）
         private const int WM_GETMINMAXINFO = 0x0024;
         private const int MONITOR_DEFAULTTONEAREST = 2;
+
+        // 自绘标题栏：样式位里保留 WS_CAPTION（DWM 据此给原生最小化/最大化动画），
+        // caption 那一行的高度在 WM_NCCALCSIZE 里抹成 0
+        private const int WM_NCCALCSIZE = 0x0083;
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NcCalcSizeParams
+        {
+            public NRect rgrc0;
+            public NRect rgrc1;
+            public NRect rgrc2;
+            public IntPtr lppos;
+        }
+
+        [DllImport("user32.dll")]
+        private static extern bool IsZoomed(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool GetWindowRect(IntPtr hWnd, out NRect lpRect);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct NPoint { public int x; public int y; }
@@ -130,6 +147,35 @@ namespace DshDesktop
 
         [DllImport("user32.dll")]
         private static extern int GetDpiForWindow(IntPtr hwnd);
+
+        // 自绘标题栏的命中测试：系统认 HTMAXBUTTON 才会在悬停时弹贴边布局菜单（Snap Layouts）
+        private const int WM_NCHITTEST = 0x0084;
+        private const int WM_NCMOUSEMOVE = 0x00A0;
+        private const int WM_NCMOUSELEAVE = 0x02A2;
+        private const int HTMAXBUTTON = 9;
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern int GetWindowThreadProcessId(IntPtr hWnd, out int pid);
+
+        /// <summary>前台窗口是不是本进程自己的：WebView2 的另存为/打印/DevTools 都会让弹层失焦，那不算"点了外面"。</summary>
+        internal static bool ForegroundIsOurs()
+        {
+            try
+            {
+                IntPtr fg = GetForegroundWindow();
+                if (fg == IntPtr.Zero) return false;
+                int pid;
+                GetWindowThreadProcessId(fg, out pid);
+                return pid == Process.GetCurrentProcess().Id;
+            }
+            catch
+            {
+                return false;
+            }
+        }
 
         [STAThread]
         private static int Main()
@@ -498,8 +544,13 @@ namespace DshDesktop
                 catch (AbandonedMutexException) { got = true; }
                 if (!got) return;
                 if (PortOpen()) return;
-                LaunchEngineProcess();
-                for (int i = 0; i < 180 && !PortOpen(); i++) Thread.Sleep(500);
+                if (BringEngineUp()) return;
+                // 引擎没起来：多半是 3080 还被没退干净的旧进程占着（dsh web 报 listen EADDRINUSE）。
+                // 清掉残留监听者、等端口真正释放，再拉一次。
+                AppendEngineLog(WebLogPath, "[desktop] 3080 未就绪，清掉残留监听者后重试");
+                KillPortListeners();
+                for (int i = 0; i < 40 && PortOpen(); i++) Thread.Sleep(250);
+                BringEngineUp();
             }
             catch
             {
@@ -508,6 +559,30 @@ namespace DshDesktop
             {
                 if (got) { try { gate.ReleaseMutex(); } catch { } }
                 if (gate != null) { try { gate.Close(); } catch { } }
+            }
+        }
+
+        /// <summary>
+        /// 拉起一次引擎并等 3080 就绪。引擎进程提前退出（端口被占时 dsh web 会立刻 EADDRINUSE 收摊）
+        /// 就当场判失败返回，不再干等到 90 秒超时。
+        /// </summary>
+        private static bool BringEngineUp()
+        {
+            try
+            {
+                LaunchEngineProcess();
+                Process p = _engineProcess;
+                for (int i = 0; i < 180; i++)
+                {
+                    if (PortOpen()) return true;
+                    if (p != null && p.HasExited) return false;
+                    Thread.Sleep(500);
+                }
+                return PortOpen();
+            }
+            catch
+            {
+                return false;
             }
         }
 
@@ -540,42 +615,6 @@ namespace DshDesktop
             catch (Exception ex)
             {
                 AppendEngineLog(WebErrLogPath, "[desktop] 启动引擎失败：" + ex.Message);
-            }
-        }
-
-        /// <summary>Whether the WiFi proxy (dsh-wifi-proxy.js on 3081) is already listening.</summary>
-        private static bool ProxyOpen()
-        {
-            try
-            {
-                using (TcpClient c = new TcpClient())
-                {
-                    c.Connect(Host, ProxyPort);
-                    return true;
-                }
-            }
-            catch
-            {
-                return false;
-            }
-        }
-
-        /// <summary>Start the WiFi proxy so phones on the same LAN can reach DSH.</summary>
-        private static void StartProxy()
-        {
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = "node.exe";
-                psi.Arguments = "\"" + ProxyScript + "\"";
-                psi.WorkingDirectory = Root + "\\scripts";
-                psi.WindowStyle = ProcessWindowStyle.Hidden;
-                psi.CreateNoWindow = true;
-                psi.UseShellExecute = false;
-                Process.Start(psi);
-            }
-            catch
-            {
             }
         }
 
@@ -811,6 +850,8 @@ namespace DshDesktop
                 Deactivate += (s, e) =>
                 {
                     if (!ready || persistent) return;
+                    // 另存为/打印/DevTools 也会让本窗口失焦，那种不算"点了外面"
+                    if (Program.ForegroundIsOurs()) return;
                     reused = false;
                     var closeTimer = new System.Windows.Forms.Timer { Interval = 250 };
                     closeTimer.Tick += (s2, e2) =>
@@ -851,6 +892,9 @@ namespace DshDesktop
             private static readonly string SplashTemplate = Root + @"\\assets\boot-splash";
             private const string SplashHost = "splash.local";
             private WebView2 _splash;
+            /// <summary>片头保顶节拍：它可见期间，主视图/内嵌浏览器/浮层每次把自己抬上来都会被压回去。</summary>
+            private System.Windows.Forms.Timer _splashHold;
+            private const int SplashHoldMs = 120;
             // —— 右栏内嵌浏览器：主窗体里的一块 WebView2 子控件（不是独立窗口、没有坐标同步）——
             // 页面（主 WebView2 里的 DSH 右栏面板）用 chrome.webview.postMessage 把面板矩形的
             // getBoundingClientRect() + dpr 报过来，这里按矩形摆它；面板关掉/切走就隐藏。
@@ -877,58 +921,151 @@ namespace DshDesktop
                 public bool Fitted;
             }
             /// <summary>加载遮罩：导航期间盖住旧页面（WebView2 默认会一直显示旧页直到新页首帧，
-            /// 面板那边看不到任何动静，观感就是"点了没反应"）。</summary>
+            /// 面板那边看不到任何动静，观感就是"点了没反应"）。
+            /// 转圈按真实时间走（0.85s 一圈）、进出各 150ms 淡入淡出，颜色跟外壳主题。</summary>
             private sealed class EmbedMask : Control
             {
-                public double Angle;
+                private const double TurnMs = 850.0;
+                private const double FadeMs = 150.0;
+
+                private readonly System.Windows.Forms.Timer _tick;
+                private readonly AnimClock _clock = new AnimClock();
+                private readonly AnimClock _spin = new AnimClock();
+                private Action _onGone;
+                private double _alpha;
+                private double _from;
+                private double _target;
+                private double _fadeMs;
 
                 public EmbedMask()
                 {
                     SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
                         | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
                     Visible = false;
+                    _tick = new System.Windows.Forms.Timer { Interval = 16 };
+                    _tick.Tick += delegate(object s, EventArgs e) { Step(); };
+                }
+
+                public void FadeIn()
+                {
+                    _onGone = null;
+                    _from = _alpha;
+                    _target = 1.0;
+                    _fadeMs = FadeMs;
+                    _clock.Restart();
+                    if (!Visible)
+                    {
+                        Visible = true;
+                        _spin.Restart();
+                    }
+                    _tick.Start();
+                    Invalidate();
+                }
+
+                /// <summary>淡出，淡完回调 onGone：把画面放回来必须等遮罩真的没了，
+                /// 否则原生子控件（WebView2）一起身就直接盖住还没淡完的遮罩。</summary>
+                public void FadeOut(Action onGone)
+                {
+                    if (!Visible)
+                    {
+                        if (onGone != null) onGone();
+                        return;
+                    }
+                    _onGone = onGone;
+                    _from = _alpha;
+                    _target = 0.0;
+                    _fadeMs = FadeMs;
+                    _clock.Restart();
+                    _tick.Start();
+                }
+
+                private void Step()
+                {
+                    if (_fadeMs > 0.0)
+                    {
+                        double t = Ease.OutCubic(_clock.T(_fadeMs));
+                        _alpha = _from + (_target - _from) * t;
+                        if (t >= 1.0)
+                        {
+                            _fadeMs = 0.0;
+                            _alpha = _target;
+                            if (_target <= 0.0)
+                            {
+                                _tick.Stop();
+                                Visible = false;
+                                Action done = _onGone;
+                                _onGone = null;
+                                if (done != null) done();
+                                return;
+                            }
+                        }
+                    }
+                    Invalidate();
                 }
 
                 protected override void OnPaint(PaintEventArgs e)
                 {
                     Graphics g = e.Graphics;
-                    using (SolidBrush back = new SolidBrush(Color.FromArgb(0x15, 0x15, 0x17)))
+                    using (SolidBrush back = new SolidBrush(ShellPalette.Surface))
                     {
                         g.FillRectangle(back, ClientRectangle);
                     }
-                    int size = 30;
+                    float s = g.DpiX / 96f;
+                    if (s <= 0f) s = 1f;
+                    int size = (int)Math.Round(30f * s);
                     int cx = Width / 2;
                     int cy = Height / 2;
                     if (cx < size || cy < size) return;
-                    g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                    double a = _alpha < 0.0 ? 0.0 : (_alpha > 1.0 ? 1.0 : _alpha);
+                    double angle = (_spin.Ms % TurnMs) / TurnMs * 360.0;
                     Rectangle box = new Rectangle(cx - size / 2, cy - size / 2, size, size);
-                    using (Pen track = new Pen(Color.FromArgb(0x2A, 0x2E, 0x36), 2.6f))
+                    using (Pen track = new Pen(Ease.Alpha(ShellPalette.Line, a), 2.6f))
                     {
                         g.DrawEllipse(track, box);
                     }
-                    // 渐隐尾巴：16 小段拼出约 100° 的弧，尾端渐淡，转起来就是常见的加载环
-                    const int segments = 16;
+                    // 渐隐尾巴：24 小段拼出 96° 的弧，尾端渐淡；段密了接缝就看不出来
+                    const int segments = 24;
                     for (int i = 0; i < segments; i++)
                     {
-                        int alpha = 10 + (int)(245.0 * (i + 1) / segments);
-                        using (Pen arc = new Pen(Color.FromArgb(alpha, 0x6F, 0xA8, 0xFF), 3f))
+                        double w = (i + 1) / (double)segments;
+                        using (Pen arc = new Pen(Ease.Alpha(ShellPalette.Accent, a * (0.08 + 0.92 * w)), 3f))
                         {
-                            arc.StartCap = System.Drawing.Drawing2D.LineCap.Round;
-                            arc.EndCap = System.Drawing.Drawing2D.LineCap.Round;
-                            g.DrawArc(arc, box, (float)(Angle + i * 6.0), 8f);
+                            arc.StartCap = LineCap.Round;
+                            arc.EndCap = LineCap.Round;
+                            g.DrawArc(arc, box, (float)(angle + i * 4.0), 4.6f);
                         }
                     }
                 }
+
+                protected override void Dispose(bool disposing)
+                {
+                    if (disposing)
+                    {
+                        _tick.Stop();
+                        _tick.Dispose();
+                    }
+                    base.Dispose(disposing);
+                }
             }
 
-            /// <summary>启动/重连遮罩：深色底 + 居中状态文字 + 一条来回扫动的细进度线；只在可见时跑定时器。</summary>
+            /// <summary>启动/重连遮罩：主题底 + 居中状态文字 + 一条来回扫动的细进度线；只在可见时跑定时器，进出都淡。</summary>
             private sealed class LoadingView : Control
             {
+                private const double FadeInMs = 170.0;
+                private const double FadeOutMs = 150.0;
+                private const double SweepMs = 1800.0;
+
                 private readonly Font _fTitle = new Font("Microsoft YaHei UI", 13f, FontStyle.Regular);
                 private readonly Font _fDetail = new Font("Microsoft YaHei UI", 10f, FontStyle.Regular);
                 private readonly System.Windows.Forms.Timer _anim;
+                private readonly AnimClock _clock = new AnimClock();
+                private readonly AnimClock _loop = new AnimClock();
                 private double _phase;
                 private double _fade;
+                private double _from;
+                private double _target;
+                private double _fadeMs;
                 private string _title = "正在连接 DSH";
                 private string _detail = "";
 
@@ -937,7 +1074,7 @@ namespace DshDesktop
                     SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
                         | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
                     // _anim 必须先建好：下面这行 SetVisibleCore 会立刻回调 OnVisibleChanged，那里要 _anim.Stop()
-                    _anim = new System.Windows.Forms.Timer { Interval = 40 };
+                    _anim = new System.Windows.Forms.Timer { Interval = 16 };
                     _anim.Tick += delegate(object s, EventArgs e) { Step(); };
                     Visible = false;
                 }
@@ -947,11 +1084,26 @@ namespace DshDesktop
                 {
                     _title = title ?? "";
                     _detail = detail ?? "";
-                    _fade = 0;
+                    Fade(1.0, FadeInMs);
                     Visible = true;
                     BringToFront();
-                    _anim.Start();
                     Invalidate();
+                }
+
+                /// <summary>淡出后再隐藏：旧写法是直接 Visible=false，进来 360ms、出去 0ms，一进一出不对称。</summary>
+                public void HideState()
+                {
+                    if (!Visible) return;
+                    Fade(0.0, FadeOutMs);
+                }
+
+                private void Fade(double target, double ms)
+                {
+                    _from = _fade;
+                    _target = target;
+                    _fadeMs = ms;
+                    _clock.Restart();
+                    _anim.Start();
                 }
 
                 protected override void OnVisibleChanged(EventArgs e)
@@ -959,7 +1111,7 @@ namespace DshDesktop
                     base.OnVisibleChanged(e);
                     if (Visible)
                     {
-                        _fade = 0;
+                        _loop.Restart();
                         _anim.Start();
                     }
                     else
@@ -970,9 +1122,24 @@ namespace DshDesktop
 
                 private void Step()
                 {
-                    _phase += 0.022;
-                    if (_phase >= 1.0) _phase -= 1.0;
-                    if (_fade < 1.0) _fade = Math.Min(1.0, _fade + 0.11);
+                    // 相位按真实时间走：旧写法每帧 +0.022，系统一忙整条进度线就跟着变慢
+                    _phase = (_loop.Ms % SweepMs) / SweepMs;
+                    if (_fadeMs > 0.0)
+                    {
+                        double t = Ease.OutCubic(_clock.T(_fadeMs));
+                        _fade = _from + (_target - _from) * t;
+                        if (t >= 1.0)
+                        {
+                            _fadeMs = 0.0;
+                            _fade = _target;
+                            if (_target <= 0.0)
+                            {
+                                _anim.Stop();
+                                Visible = false;
+                                return;
+                            }
+                        }
+                    }
                     Invalidate();
                 }
 
@@ -991,7 +1158,7 @@ namespace DshDesktop
                 protected override void OnPaint(PaintEventArgs e)
                 {
                     Graphics g = e.Graphics;
-                    using (SolidBrush back = new SolidBrush(Color.FromArgb(0x15, 0x15, 0x17)))
+                    using (SolidBrush back = new SolidBrush(ShellPalette.Surface))
                     {
                         g.FillRectangle(back, ClientRectangle);
                     }
@@ -1000,20 +1167,20 @@ namespace DshDesktop
                     if (cx < 60 || cy < 60) return;
                     float s = g.DpiX / 96f;
                     if (s <= 0f) s = 1f;
-                    int a = (int)(255 * _fade);
+                    double a = _fade < 0.0 ? 0.0 : (_fade > 1.0 ? 1.0 : _fade);
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
                     using (StringFormat sf = new StringFormat())
                     {
                         sf.Alignment = StringAlignment.Center;
                         sf.LineAlignment = StringAlignment.Center;
-                        using (SolidBrush b = new SolidBrush(Color.FromArgb(a, 0xE6, 0xE9, 0xEF)))
+                        using (SolidBrush b = new SolidBrush(Ease.Alpha(ShellPalette.Text, a)))
                         {
                             g.DrawString(_title, _fTitle, b, new RectangleF(0f, cy - 30f * s, Width, 30f * s), sf);
                         }
                         if (_detail.Length > 0)
                         {
-                            using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(a * 0.72), 0x8A, 0x92, 0xA0)))
+                            using (SolidBrush b = new SolidBrush(Ease.Alpha(ShellPalette.TextDim, a * 0.9)))
                             {
                                 g.DrawString(_detail, _fDetail, b, new RectangleF(0f, cy + 2f * s, Width, 22f * s), sf);
                             }
@@ -1024,17 +1191,17 @@ namespace DshDesktop
                     int barX = cx - barW / 2;
                     int barY = cy + (int)(34f * s);
                     Rectangle track = new Rectangle(barX, barY, barW, barH);
-                    using (GraphicsPath p = DialogUi.Round(track, barH))
-                    using (SolidBrush b = new SolidBrush(Color.FromArgb((int)(a * 0.85), 0x26, 0x2A, 0x32)))
+                    using (GraphicsPath p = ShellDraw.Round(track, barH))
+                    using (SolidBrush b = new SolidBrush(Ease.Alpha(ShellPalette.Line, a * 0.9)))
                     {
                         g.FillPath(b, p);
                     }
                     int fgW = (int)(barW * 0.34f);
                     double t = 0.5 - 0.5 * Math.Cos(2.0 * Math.PI * _phase);
                     Rectangle head = new Rectangle(barX + (int)((barW - fgW) * t), barY, fgW, barH);
-                    using (GraphicsPath p = DialogUi.Round(head, barH))
+                    using (GraphicsPath p = ShellDraw.Round(head, barH))
                     using (LinearGradientBrush lg = new LinearGradientBrush(head,
-                        Color.FromArgb((int)(a * 0.55), 0x3F, 0x6B, 0xC8), Color.FromArgb(a, 0x6F, 0xA8, 0xFF),
+                        Ease.Alpha(ShellPalette.AccentDim, a * 0.55), Ease.Alpha(ShellPalette.Accent, a),
                         LinearGradientMode.Horizontal))
                     {
                         g.FillPath(lg, p);
@@ -1042,28 +1209,37 @@ namespace DshDesktop
                 }
             }
 
-            /// <summary>自绘标题栏：左侧应用图标 + 右侧最小化/最大化/关闭；空白处按下交给系统的 HTCAPTION 拖动（双击最大化与贴边 Snap 跟着系统走）。</summary>
+            /// <summary>自绘标题栏：左侧应用图标 + 右侧最小化/最大化/关闭；空白处按下交给系统的 HTCAPTION 拖动（双击最大化与贴边 Snap 跟着系统走）。
+            /// 悬停走 120ms 色值过渡（和页面内 .12s 的 hover 同手感）；最大化键在命中测试里报 HTMAXBUTTON，
+            /// Win11 的贴边布局菜单（Snap Layouts）才有得弹。</summary>
             private sealed class TitleBar : Control
             {
                 private const int WM_NCLBUTTONDOWN = 0x00A1;
                 private const int HTCAPTION = 2;
+                private const double HoverMs = 120.0;
                 private int _hot = -1;
                 private int _down = -1;
-                private float _scale = 1f;
                 private Image _icon;
-                private bool _dark = true;
-                private Color _glyph = Color.FromArgb(0x99, 0x9F, 0xA9);
-                private Color _glyphHot = Color.FromArgb(0xE6, 0xE9, 0xEF);
-                private Color _hoverFill = Color.FromArgb(0x18, 0xFF, 0xFF, 0xFF);
+                private readonly System.Windows.Forms.Timer _anim;
+                private readonly AnimClock _clock = new AnimClock();
+                private readonly double[] _hover = new double[3];
+                private readonly double[] _hoverFrom = new double[3];
+                private readonly double[] _hoverTo = new double[3];
 
-                /// <summary>页面切浅色时头部跟着换：底色、字形色、悬停底色成对换，别留一块深色孤岛。</summary>
+                /// <summary>DPI 缩放：绘制与命中测试共用（旧写法只在 OnPaint 里更新 _scale，命中测试可能拿到旧值）。</summary>
+                private float S
+                {
+                    get
+                    {
+                        float s = DeviceDpi / 96f;
+                        return s <= 0f ? 1f : s;
+                    }
+                }
+
+                /// <summary>页面切浅色时头部跟着换：颜色本身从 ShellPalette 取，这里只管底色与重画。</summary>
                 public void SetTheme(Color back, bool dark)
                 {
                     BackColor = back;
-                    _dark = dark;
-                    _glyph = dark ? Color.FromArgb(0x99, 0x9F, 0xA9) : Color.FromArgb(0x6B, 0x72, 0x80);
-                    _glyphHot = dark ? Color.FromArgb(0xE6, 0xE9, 0xEF) : Color.FromArgb(0x1F, 0x23, 0x28);
-                    _hoverFill = dark ? Color.FromArgb(0x18, 0xFF, 0xFF, 0xFF) : Color.FromArgb(0x14, 0x00, 0x00, 0x00);
                     Invalidate();
                 }
 
@@ -1071,11 +1247,13 @@ namespace DshDesktop
                 {
                     SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
                         | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
-                    BackColor = Color.FromArgb(0x15, 0x15, 0x17);
-                    _icon = LoadIconImage(IconPath, 32);
+                    BackColor = ShellPalette.Surface;
+                    _anim = new System.Windows.Forms.Timer { Interval = 16 };
+                    _anim.Tick += delegate(object s, EventArgs e) { Step(); };
+                    _icon = LoadIconImage(IconPath, 64);
                     if (_icon == null)
                     {
-                        try { _icon = new Icon(IconPath, 32, 32).ToBitmap(); }
+                        try { _icon = new Icon(IconPath, 64, 64).ToBitmap(); }
                         catch { }
                     }
                 }
@@ -1120,9 +1298,10 @@ namespace DshDesktop
                     catch { return null; }
                 }
 
+                /// <summary>标题栏高度：32px 是 Win11 自带应用那套指标（原来 38px，和资源管理器并排会高出一截）。</summary>
                 public static int ScaledHeight(float dpi)
                 {
-                    return (int)Math.Round(38f * (dpi / 96f));
+                    return (int)Math.Round(32f * (dpi / 96f));
                 }
 
                 private Rectangle BtnRect(int i, float s)
@@ -1133,8 +1312,46 @@ namespace DshDesktop
 
                 private int Hit(int x, int y)
                 {
-                    for (int i = 0; i < 3; i++) if (BtnRect(i, _scale).Contains(x, y)) return i;
+                    for (int i = 0; i < 3; i++) if (BtnRect(i, S).Contains(x, y)) return i;
                     return -1;
+                }
+
+                /// <summary>给 WM_NCHITTEST 用：这一点落在最大化键上吗（本控件客户坐标）。</summary>
+                public bool OverMaxButton(Point clientPoint)
+                {
+                    return BtnRect(1, S).Contains(clientPoint);
+                }
+
+                /// <summary>鼠标被判成非客户区后不再有 WM_MOUSEMOVE，悬停只能靠非客户区消息喂进来。</summary>
+                public void NcHover(Point clientPoint)
+                {
+                    SetHot(BtnRect(1, S).Contains(clientPoint) ? 1 : -1);
+                }
+
+                /// <summary>悬停变化：起点→目标 120ms 顺出去（旧写法是 Invalidate 直接换色）。</summary>
+                private void SetHot(int h)
+                {
+                    if (h == _hot) return;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        _hoverFrom[i] = _hover[i];
+                        _hoverTo[i] = (i == h) ? 1.0 : 0.0;
+                    }
+                    _hot = h;
+                    _clock.Restart();
+                    _anim.Start();
+                    Invalidate();
+                }
+
+                private void Step()
+                {
+                    double t = Ease.OutCubic(_clock.T(HoverMs));
+                    for (int i = 0; i < 3; i++)
+                    {
+                        _hover[i] = _hoverFrom[i] + (_hoverTo[i] - _hoverFrom[i]) * t;
+                    }
+                    if (t >= 1.0) _anim.Stop();
+                    Invalidate();
                 }
 
                 protected override void Dispose(bool disposing)
@@ -1146,14 +1363,16 @@ namespace DshDesktop
                 protected override void OnMouseMove(MouseEventArgs e)
                 {
                     base.OnMouseMove(e);
-                    int h = (_down >= 0) ? _down : Hit(e.X, e.Y);
-                    if (h != _hot) { _hot = h; Invalidate(); }
+                    SetHot((_down >= 0) ? _down : Hit(e.X, e.Y));
                 }
 
                 protected override void OnMouseLeave(EventArgs e)
                 {
                     base.OnMouseLeave(e);
-                    if (_hot != -1) { _hot = -1; Invalidate(); }
+                    // 命中测试报 HTMAXBUTTON 之后鼠标算"非客户区"，这里会跟着来一发 leave；
+                    // 光标其实还压在键上就别清，否则悬停底色和贴边菜单会一闪一闪。
+                    if (BtnRect(1, S).Contains(PointToClient(Cursor.Position))) return;
+                    SetHot(-1);
                 }
 
                 protected override void OnMouseDown(MouseEventArgs e)
@@ -1180,8 +1399,7 @@ namespace DshDesktop
                     if (_down < 0) return;
                     int act = (Hit(e.X, e.Y) == _down) ? _down : -1;
                     _down = -1;
-                    _hot = -1;
-                    Invalidate();
+                    SetHot(-1);
                     Form f = FindForm();
                     if (f == null || act < 0) return;
                     if (act == 0) f.WindowState = FormWindowState.Minimized;
@@ -1193,9 +1411,10 @@ namespace DshDesktop
                 protected override void OnPaint(PaintEventArgs e)
                 {
                     Graphics g = e.Graphics;
-                    float s = g.DpiX / 96f;
-                    if (s <= 0f) s = 1f;
-                    _scale = s;
+                    // 画的和点的必须是同一个缩放：这里原来用 g.DpiX，命中测试用 DeviceDpi，
+                    // 200% 缩放下两者差一倍，视觉按钮与命中区域整整错开一颗键——
+                    // 点"还原"落到"最小化"上，点"最小化"落到空白上。
+                    float s = S;
                     g.SmoothingMode = SmoothingMode.AntiAlias;
                     using (SolidBrush back = new SolidBrush(BackColor))
                     {
@@ -1203,7 +1422,7 @@ namespace DshDesktop
                     }
                     if (_icon != null)
                     {
-                        int isz = (int)Math.Round(16f * s);
+                        int isz = (int)Math.Round(28f * s);
                         g.InterpolationMode = InterpolationMode.HighQualityBicubic;
                         g.DrawImage(_icon, new Rectangle((int)Math.Round(14f * s), (Height - isz) / 2, isz, isz));
                     }
@@ -1211,20 +1430,21 @@ namespace DshDesktop
                     for (int i = 0; i < 3; i++)
                     {
                         Rectangle r = BtnRect(i, s);
-                        bool hot = (_hot == i);
-                        if (i == 2 && hot)
+                        double h = _hover[i];
+                        if (h > 0.003)
                         {
-                            using (SolidBrush b = new SolidBrush(Color.FromArgb(0xC4, 0x2B, 0x1C))) g.FillRectangle(b, r);
+                            Color fill = (i == 2)
+                                ? Ease.Alpha(ShellPalette.CloseHot, h)
+                                : Color.FromArgb((int)Math.Round(ShellPalette.HoverAlpha * h), ShellPalette.HoverFill);
+                            using (SolidBrush b = new SolidBrush(fill)) g.FillRectangle(b, r);
                         }
-                        else if (hot)
-                        {
-                            using (SolidBrush b = new SolidBrush(_hoverFill)) g.FillRectangle(b, r);
-                        }
-                        Color fg = (i == 2 && hot) ? Color.White : (hot ? _glyphHot : _glyph);
+                        Color fg = (i == 2)
+                            ? Ease.Blend(ShellPalette.TextMute, Color.White, h)
+                            : Ease.Blend(ShellPalette.TextMute, ShellPalette.Text, h);
                         float cx = r.X + r.Width / 2f;
                         float cy = r.Y + r.Height / 2f;
-                        float u = 5f * s;
-                        using (Pen p = new Pen(fg, Math.Max(1f, 1.1f * s)))
+                        float u = 10f * s;
+                        using (Pen p = new Pen(fg, Math.Max(1f, 2.2f * s)))
                         {
                             p.StartCap = LineCap.Round;
                             p.EndCap = LineCap.Round;
@@ -1237,10 +1457,10 @@ namespace DshDesktop
                                 if (maxed)
                                 {
                                     float w = u * 1.7f;
-                                    float bx = cx - u + 1.6f * s;
+                                    float bx = cx - u + 3.2f * s;
                                     float by = cy - u;
                                     float fx = cx - u;
-                                    float fy = cy - u + 1.6f * s;
+                                    float fy = cy - u + 3.2f * s;
                                     g.DrawLine(p, bx, by, bx + w, by);
                                     g.DrawLine(p, bx + w, by, bx + w, by + w);
                                     g.DrawRectangle(p, fx, fy, w, w);
@@ -1258,6 +1478,57 @@ namespace DshDesktop
                         }
                     }
                 }
+
+                /// <summary>一次按下只翻一次。命中测试报 HTMAXBUTTON 之后，这条非客户区消息
+                /// 子控件与窗体两处都写了"兜一手"，谁先到谁翻；两边都翻等于翻两次，正好抵消 ——
+                /// 表现就是点最大化键没反应。</summary>
+                private static int _lastMaxToggle;
+
+                internal static void ToggleMaximize(Form f)
+                {
+                    if (f == null) return;
+                    int now = Environment.TickCount;
+                    if (_lastMaxToggle != 0 && unchecked(now - _lastMaxToggle) < 250) return;
+                    _lastMaxToggle = now;
+                    f.WindowState = (f.WindowState == FormWindowState.Maximized)
+                        ? FormWindowState.Normal : FormWindowState.Maximized;
+                }
+
+                /// <summary>命中测试对最大化键报 HTMAXBUTTON：系统的贴边布局菜单认这个返回值，
+                /// 之后鼠标消息走非客户区；点击自己吃掉并翻窗口状态，免得系统再翻一次。</summary>
+                protected override void WndProc(ref Message m)
+                {
+                    if (m.Msg == Program.WM_NCHITTEST)
+                    {
+                        if (OverMaxButton(PointToClient(ScreenPoint(m.LParam))))
+                        {
+                            m.Result = (IntPtr)Program.HTMAXBUTTON;
+                            return;
+                        }
+                    }
+                    else if (m.Msg == Program.WM_NCLBUTTONDOWN && m.WParam.ToInt32() == Program.HTMAXBUTTON)
+                    {
+                        ToggleMaximize(FindForm());
+                        m.Result = IntPtr.Zero;
+                        return;
+                    }
+                    else if (m.Msg == Program.WM_NCMOUSEMOVE)
+                    {
+                        NcHover(PointToClient(ScreenPoint(m.LParam)));
+                    }
+                    else if (m.Msg == Program.WM_NCMOUSELEAVE)
+                    {
+                        NcHover(PointToClient(Cursor.Position));
+                    }
+                    base.WndProc(ref m);
+                }
+
+                /// <summary>lParam 里的屏幕坐标（两个 16 位有符号分量）。</summary>
+                private static Point ScreenPoint(IntPtr lParam)
+                {
+                    int lp = lParam.ToInt32();
+                    return new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF));
+                }
             }
 
             private EmbedMask _embedMask;
@@ -1265,9 +1536,9 @@ namespace DshDesktop
             private System.Windows.Forms.Timer _embedMaskDelay;
             /// <summary>延迟撤除（140ms）：JS 重定向紧接着又开一次导航时不闪回旧页。</summary>
             private System.Windows.Forms.Timer _embedMaskClear;
-            private System.Windows.Forms.Timer _embedMaskSpin;
             private bool _embedMaskOn;
-            private double _embedMaskAngle;
+            /// <summary>遮罩的代数：淡出回调只在代数没变时才把画面放回来。</summary>
+            private int _embedMaskGen;
             private const int EmbedMaskDelayMs = 180;
             private const int EmbedMaskClearMs = 140;
             private readonly List<EmbedTab> _embedTabs = new List<EmbedTab>();
@@ -1369,8 +1640,8 @@ namespace DshDesktop
             }
             private readonly List<EmbedDownload> _downloads = new List<EmbedDownload>();
             private int _downloadSerial;
-            /// <summary>内嵌视图的底色：页面前一帧、后台标签换页时露出的就是它，不设是白的。</summary>
-            private static readonly Color EmbedBack = Color.FromArgb(0x15, 0x15, 0x17);
+            /// <summary>内嵌视图的底色：页面前一帧、后台标签换页时露出的就是它，不设是白的。跟外壳主题走。</summary>
+            private static Color EmbedBack { get { return ShellPalette.Surface; } }
             /// <summary>WebView2 的 WinForms 控件不把键事件交给宿主，快捷键只能在页面里拦（Ctrl+T/W/L/Tab/1-8）。</summary>
             private const string EmbedKeyScript = @"(function(){
   if (window.__dshEmbedKeys) return; window.__dshEmbedKeys = 1;
@@ -1382,15 +1653,15 @@ namespace DshDesktop
     try { chrome.webview.postMessage({ kind: 'dsh-embed-key', key: k, shift: e.shiftKey === true }); } catch (err) {}
   }, true);
 })();";
-            /// <summary>打不开页面时顶掉 Chromium 那张浅色错误页；__REASON__ / __URL__ 由 EmbedErrorHtml 填。</summary>
+            /// <summary>打不开页面时顶掉 Chromium 那张浅色错误页；__REASON__ / __URL__ 与 __C_*__ 配色由 EmbedErrorHtml 填。</summary>
             private const string EmbedErrorTemplate = @"<!doctype html><html><head><meta charset='utf-8'><style>
-html,body{margin:0;padding:0;height:100%;background:#151517;color:#c6cad3;font:14px/1.6 'Microsoft YaHei UI','Segoe UI',sans-serif;-webkit-user-select:none}
+html,body{margin:0;padding:0;height:100%;background:__C_BG__;color:__C_DIM__;font:14px/1.6 'Microsoft YaHei UI','Segoe UI',sans-serif;-webkit-user-select:none}
 body{display:flex;align-items:center;justify-content:center}
 .card{display:flex;flex-direction:column;align-items:center;gap:9px;max-width:80%;text-align:center}
-svg{color:#5b616b}
-.t{font-size:15px;color:#e6e9ef}
-.r{font-size:13px;color:#8b919b}
-.u{font-size:12px;color:#6f757e;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+svg{color:__C_ICON__}
+.t{font-size:15px;color:__C_TEXT__}
+.r{font-size:13px;color:__C_DIM__}
+.u{font-size:12px;color:__C_MUTE__;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 button{margin-top:8px;height:30px;padding:0 18px;border:0;border-radius:6px;background:#3b6ef0;color:#fff;font-size:13px;cursor:pointer}
 button:hover{background:#4a7cf5}
 </style></head><body><div class='card'>
@@ -1418,23 +1689,37 @@ document.getElementById('retry').onclick=function(){try{chrome.webview.postMessa
             /// <summary>浮层页面：静态骨架，列表由面板数据经 ExecuteScriptAsync 注入。</summary>
             private const string ShelfHtml = @"<!doctype html><html><head><meta charset='utf-8'><style>
 html,body{margin:0;padding:0;height:100%;overflow:hidden;background:transparent;font:13px/1.5 'Microsoft YaHei UI','Segoe UI',sans-serif;-webkit-user-select:none}
+:root{--card:#1e2024;--line:rgba(255,255,255,.09);--row:#c6cad3;--rowhot:#fff;--hover:rgba(255,255,255,.09);--ico:rgba(255,255,255,.09);--empty:#7d838d;--thumb:rgba(255,255,255,.14);--thumbhot:rgba(255,255,255,.24)}
 body{display:flex;box-sizing:border-box}
 /* 子控件的透明只能透到父窗体背景、透不到下面的网页，所以卡片直接铺满控件，只让四个角露出一点点深色 */
-#card{flex:1 1 auto;min-width:0;min-height:0;display:flex;flex-direction:column;background:#1e2024;border:1px solid rgba(255,255,255,.09);border-radius:10px;overflow:hidden;box-shadow:inset 0 1px 0 rgba(255,255,255,.05);visibility:hidden}
+#card{flex:1 1 auto;min-width:0;min-height:0;display:flex;flex-direction:column;background:var(--card);border:1px solid var(--line);border-radius:10px;overflow:hidden;box-shadow:inset 0 1px 0 var(--line);visibility:hidden}
 #list{flex:1 1 auto;min-height:0;overflow:auto;padding:6px}
-.row{display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;box-sizing:border-box;border-radius:8px;color:#c6cad3;cursor:default;transition:background .12s ease,color .12s ease}
-.row:hover{background:rgba(255,255,255,.09);color:#fff}
+.row{display:flex;align-items:center;gap:10px;height:32px;padding:0 10px;box-sizing:border-box;border-radius:8px;color:var(--row);cursor:default;transition:background .12s ease,color .12s ease}
+.row:hover{background:var(--hover);color:var(--rowhot)}
 /* 图标用 div 打底：img 加载失败会画出破图占位，div 的 background-image 失败只会剩底色 */
-.ico{width:18px;height:18px;border-radius:4px;flex:0 0 auto;background-color:rgba(255,255,255,.09);background-size:contain;background-position:center;background-repeat:no-repeat}
+.ico{width:18px;height:18px;border-radius:4px;flex:0 0 auto;background-color:var(--ico);background-size:contain;background-position:center;background-repeat:no-repeat}
 .t{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.empty{padding:12px;color:#7d838d;font-size:12px}
+.empty{padding:12px;color:var(--empty);font-size:12px}
 #list::-webkit-scrollbar{width:10px}
-#list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.14);border-radius:5px}
-#list::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.24)}
+#list::-webkit-scrollbar-thumb{background:var(--thumb);border-radius:5px}
+#list::-webkit-scrollbar-thumb:hover{background:var(--thumbhot)}
 #list::-webkit-scrollbar-track{background:transparent}
 </style></head><body><div id='card'><div id='list'></div></div><script>
 var box=document.getElementById('list');
 var card=document.getElementById('card');
+/* 深浅由外壳推过来：这块是独立 WebView2，读不到主界面的主题 */
+function shelfTheme(dark){
+  var r=document.documentElement.style;
+  r.setProperty('--card', dark?'#1e2024':'#ffffff');
+  r.setProperty('--line', dark?'rgba(255,255,255,.09)':'rgba(0,0,0,.10)');
+  r.setProperty('--row', dark?'#c6cad3':'#3a3f47');
+  r.setProperty('--rowhot', dark?'#ffffff':'#101216');
+  r.setProperty('--hover', dark?'rgba(255,255,255,.09)':'rgba(0,0,0,.06)');
+  r.setProperty('--ico', dark?'rgba(255,255,255,.09)':'rgba(0,0,0,.07)');
+  r.setProperty('--empty', dark?'#7d838d':'#8a9099');
+  r.setProperty('--thumb', dark?'rgba(255,255,255,.14)':'rgba(0,0,0,.18)');
+  r.setProperty('--thumbhot', dark?'rgba(255,255,255,.24)':'rgba(0,0,0,.30)');
+}
 function hostOf(u){try{return new URL(u).hostname.replace(/^www\./,'');}catch(e){return u;}}
 function renderShelf(items){
   card.style.visibility='visible';
@@ -1458,7 +1743,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 Text = "DeepSeek Harness";
                 AutoScaleMode = AutoScaleMode.None;
                 // 浮层控件透明区透出来的就是这个颜色：深色才像卡片阴影，系统默认浅灰会是一圈发灰的边
-                BackColor = Color.FromArgb(0x15, 0x15, 0x17);
+                BackColor = ShellPalette.Surface;
                 // Default window: 75% of the working-area width, 16:9 aspect ratio,
                 // centered on the primary screen (physical pixels, PMv2-aware).
                 Rectangle wa = Screen.PrimaryScreen.WorkingArea;
@@ -1492,7 +1777,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 }
                 web = new WebView2();
                 web.Dock = DockStyle.Fill;
-                try { web.DefaultBackgroundColor = Color.FromArgb(0x15, 0x15, 0x17); } catch { }
+                try { web.DefaultBackgroundColor = ShellPalette.Surface; } catch { }
                 Controls.Add(web);
                 // 加载遮罩：盖在 WebView2 之上；加载成功即隐藏，因此不会挡住页面。
                 // （黑屏那次就是这个状态一直挂着不消失——因为没有任何重试逻辑）
@@ -1508,6 +1793,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 try { _splash.DefaultBackgroundColor = Color.Black; } catch { }
                 Controls.Add(_splash);
                 _splash.BringToFront();
+                StartSplashHold();
                 _titleBar = new TitleBar();
                 _titleBar.Location = new Point(0, 0);
                 _titleBar.Height = TitleBar.ScaledHeight(96f);
@@ -1518,14 +1804,13 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 Shown += OnShown;
             }
 
-            /// <summary>自绘标题栏：去掉系统标题栏（WS_CAPTION），保留缩放边框（WS_THICKFRAME）——缩放、贴边 Snap、阴影、圆角仍由系统提供。</summary>
+            /// <summary>自绘标题栏：样式位全留（含 WS_CAPTION），caption 的高度在 WM_NCCALCSIZE 里抹成 0——缩放、贴边 Snap、阴影、圆角、最小化/最大化动画都由系统提供。</summary>
             protected override CreateParams CreateParams
             {
                 get
                 {
                     CreateParams cp = base.CreateParams;
                     cp.Style |= 0x00040000;
-                    cp.Style &= ~0x00C00000;
                     return cp;
                 }
             }
@@ -1577,9 +1862,12 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 }
                 IntPtr h = Handle;
                 TryDwm(h, DwmUseImmersiveDarkMode, _shellDark ? 1 : 0);
-                TryDwm(h, DwmCaptionColor, _shellDark ? DwmColor(0x15, 0x15, 0x17) : DwmColor(0xF3, 0xF4, 0xF6));
-                TryDwm(h, DwmTextColor, _shellDark ? DwmColor(0xD8, 0xDC, 0xE4) : DwmColor(0x1F, 0x23, 0x28));
-                TryDwm(h, DwmBorderColor, _shellDark ? DwmColor(0x2A, 0x2E, 0x36) : DwmColor(0xD8, 0xDC, 0xE0));
+                Color cap = ShellPalette.Surface;
+                Color capText = ShellPalette.Text;
+                Color capLine = ShellPalette.Line;
+                TryDwm(h, DwmCaptionColor, DwmColor(cap.R, cap.G, cap.B));
+                TryDwm(h, DwmTextColor, DwmColor(capText.R, capText.G, capText.B));
+                TryDwm(h, DwmBorderColor, DwmColor(capLine.R, capLine.G, capLine.B));
                 TryDwm(h, DwmWindowCornerPreference, 2);
             }
 
@@ -1589,9 +1877,14 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
             private void ApplyShellTheme(bool dark)
             {
                 _shellDark = dark;
-                Color back = dark ? Color.FromArgb(0x15, 0x15, 0x17) : Color.FromArgb(0xF3, 0xF4, 0xF6);
+                ShellPalette.Set(dark);
+                Color back = ShellPalette.Surface;
                 BackColor = back;
                 if (_titleBar != null) _titleBar.SetTheme(back, dark);
+                // 自绘控件都是从 ShellPalette 现取色，重画一次就跟着换
+                if (_overlay != null) _overlay.Invalidate();
+                if (_embedMask != null) _embedMask.Invalidate();
+                PushShelfTheme();
                 if (!IsHandleCreated) return;
                 ApplyWindowChrome();
                 try { if (web != null) web.DefaultBackgroundColor = back; }
@@ -1626,7 +1919,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     // 首次导航由开机片头盖着，不再叠一块纯色遮罩；一旦要重试就让位给可读的文字提示
                     if (_attempt == 0)
                     {
-                        if (_overlay != null) _overlay.Visible = false;
+                        if (_overlay != null) _overlay.HideState();
                         if (_splash != null) _splash.Visible = true;
                     }
                     else
@@ -1670,7 +1963,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 if (_navTimer != null) _navTimer.Stop();
                 if (e.IsSuccess)
                 {
-                    if (_overlay != null) _overlay.Visible = false;
+                    if (_overlay != null) _overlay.HideState();
                     ReleaseSplashToUser();
                     return;
                 }
@@ -1738,6 +2031,42 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 catch
                 {
                 }
+                StopSplashHold();
+            }
+
+            /// <summary>
+            /// 片头是盖在界面之上的遮罩层：它还在播的时候，主视图初始化、右栏内嵌浏览器、
+            /// 收藏夹浮层每一次 BringToFront 都会把它顶下去（2026-10-06 实测：片头没播完，
+            /// 内嵌浏览器就露了出来）。所以只要它还可见，就按固定节拍连标题栏一起抬回来；
+            /// 撤掉即停表。抬升点自己也会调一次 SplashHold，节拍只是兜底。
+            /// </summary>
+            private void StartSplashHold()
+            {
+                if (_splashHold == null)
+                {
+                    _splashHold = new System.Windows.Forms.Timer { Interval = SplashHoldMs };
+                    _splashHold.Tick += delegate { SplashHold(); };
+                }
+                _splashHold.Stop();
+                _splashHold.Start();
+            }
+
+            private void StopSplashHold()
+            {
+                if (_splashHold != null) _splashHold.Stop();
+            }
+
+            private void SplashHold()
+            {
+                if (_splash == null || _splash.IsDisposed || !_splash.Visible)
+                {
+                    StopSplashHold();
+                    return;
+                }
+                try { _splash.BringToFront(); }
+                catch { }
+                try { if (_titleBar != null && !_titleBar.IsDisposed) _titleBar.BringToFront(); }
+                catch { }
             }
 
             /// <summary>片头资产摊到 ~/.dsh/boot-splash：页面每次用模板覆盖，视频与配置归用户。</summary>
@@ -2204,7 +2533,19 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
             private static string EmbedErrorHtml(string reason, string url)
             {
                 string safe = url == null ? "" : url.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
-                return EmbedErrorTemplate.Replace("__REASON__", reason == null ? "" : reason).Replace("__URL__", safe);
+                return EmbedErrorTemplate
+                    .Replace("__REASON__", reason == null ? "" : reason)
+                    .Replace("__URL__", safe)
+                    .Replace("__C_BG__", Hex(ShellPalette.Surface))
+                    .Replace("__C_TEXT__", Hex(ShellPalette.Text))
+                    .Replace("__C_DIM__", Hex(ShellPalette.TextDim))
+                    .Replace("__C_MUTE__", Hex(ShellPalette.TextMute))
+                    .Replace("__C_ICON__", Hex(ShellPalette.TextMute));
+            }
+
+            private static string Hex(Color c)
+            {
+                return "#" + c.R.ToString("x2") + c.G.ToString("x2") + c.B.ToString("x2");
             }
 
             private static string EmbedFailText(CoreWebView2WebErrorStatus status)
@@ -2550,26 +2891,13 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     Controls.Add(_embedMask);
                 }
                 if (!EmbedMaskWanted()) return;
-                _embedMaskAngle = 0;
-                _embedMask.Angle = 0;
                 try { _embedMask.Bounds = _embedBounds; } catch { }
                 _embedMaskOn = true;
                 // 遮罩是普通 GDI 控件，WebView2 是原生子控件：藏掉画面才保证遮罩一定在它上面
                 try { if (_embed != null) _embed.Visible = false; } catch { }
-                try { _embedMask.Visible = true; _embedMask.BringToFront(); } catch { }
+                try { _embedMask.BringToFront(); } catch { }
+                _embedMask.FadeIn();
                 BringShelfFront();
-                if (_embedMaskSpin == null)
-                {
-                    _embedMaskSpin = new System.Windows.Forms.Timer { Interval = 33 };
-                    _embedMaskSpin.Tick += delegate
-                    {
-                        if (!_embedMaskOn || _embedMask == null) return;
-                        _embedMaskAngle = (_embedMaskAngle + 24.0) % 360.0;
-                        _embedMask.Angle = _embedMaskAngle;
-                        _embedMask.Invalidate();
-                    };
-                }
-                _embedMaskSpin.Start();
             }
 
             /// <summary>一次导航完成后不马上撤：等 140ms，紧接着又来一次导航（JS 重定向）就继续盖着。</summary>
@@ -2601,22 +2929,34 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
             {
                 if (_embedMaskDelay != null) _embedMaskDelay.Stop();
                 if (_embedMaskClear != null) _embedMaskClear.Stop();
-                if (_embedMaskSpin != null) _embedMaskSpin.Stop();
+                // 每一次"撤遮罩"都把代数推一格：还在淡出的那次回调就此作废
+                _embedMaskGen++;
                 if (!_embedMaskOn) return;
                 _embedMaskOn = false;
-                try { if (_embedMask != null) _embedMask.Visible = false; } catch { }
-                if (!restore) return;
-                try
+                if (_embedMask == null) return;
+                // 画面放回来必须等遮罩淡完：原生子控件一起身就直接盖住还在淡出的遮罩
+                if (!restore)
                 {
-                    if (_embed != null && _embedWanted && !_embedBounds.IsEmpty)
-                    {
-                        _embed.Bounds = _embedBounds;
-                        _embed.Visible = true;
-                        _embed.BringToFront();
-                    }
+                    _embedMask.FadeOut(null);
+                    return;
                 }
-                catch { }
-                BringShelfFront();
+                int gen = _embedMaskGen;
+                _embedMask.FadeOut(delegate
+                {
+                    // 这 150ms 里面板可能已经整块让位（HideEmbed 会再推一格代数）：别把画面又放出来
+                    if (gen != _embedMaskGen) return;
+                    try
+                    {
+                        if (_embed != null && _embedWanted && !_embedBounds.IsEmpty)
+                        {
+                            _embed.Bounds = _embedBounds;
+                            _embed.Visible = true;
+                            _embed.BringToFront();
+                        }
+                    }
+                    catch { }
+                    BringShelfFront();
+                });
             }
 
             /// <summary>建一块内嵌 WebView2 子控件（共用一份 CoreWebView2Environment：同一个浏览器进程、同一个 9223 调试口）。</summary>
@@ -3037,7 +3377,8 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     _shelfFlushBusy = true;
                     _shelfItemsJson = null;
                     try { _shelf.Bounds = _shelfBounds; } catch { }
-                    // 先把列表画好、留一帧给它合成，再露面：直接显示的话先闪一个空卡片，看着就像"卡一下"
+                    // 先把主题与列表画好、留一帧给它合成，再露面：直接显示的话先闪一个空卡片，看着就像"卡一下"
+                    PushShelfTheme();
                     try { await _shelf.CoreWebView2.ExecuteScriptAsync("renderShelf(" + json + ")"); } catch { }
                     await Task.Delay(20);
                     _shelfFlushBusy = false;
@@ -3048,11 +3389,24 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     _shelf.Bounds = _shelfBounds;
                     if (!_shelf.Visible)
                     {
+                        PushShelfTheme();
                         _shelf.Visible = true;
                         _shelf.BringToFront();
                         _shelf.Focus();
                         _shelfShownAt = DateTime.Now;
                     }
+                }
+                catch { }
+            }
+
+            /// <summary>浮层是独立 WebView2，主题推过去（它读不到主界面的深浅）。</summary>
+            private void PushShelfTheme()
+            {
+                try
+                {
+                    if (_shelf == null || !_shelfReady) return;
+                    if (_shelf.CoreWebView2 == null) return;
+                    _shelf.CoreWebView2.ExecuteScriptAsync("shelfTheme(" + (_shellDark ? "true" : "false") + ")");
                 }
                 catch { }
             }
@@ -3073,6 +3427,7 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
             {
                 try { if (_shelf != null && _shelf.Visible) _shelf.BringToFront(); }
                 catch { }
+                SplashHold();
             }
 
             /// <summary>焦点离开浮层（用户点了画面或主界面）就收起；刚打开的 250ms 内不响应，免得被自己的 Focus 误判。</summary>
@@ -3246,7 +3601,6 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 // 窗口关掉后遮罩的定时器还会 tick 到已释放的控件，先停掉
                 if (_embedMaskDelay != null) _embedMaskDelay.Stop();
                 if (_embedMaskClear != null) _embedMaskClear.Stop();
-                if (_embedMaskSpin != null) _embedMaskSpin.Stop();
                 // 2026-09-11：取消关闭询问弹窗，点 X 一律静默驻留托盘（引擎 3080 与 WiFi 反代 3081 继续跑），
                 // 双击托盘图标随时唤回；系统注销/关机（CloseReason 非 UserClosing）仍直接放行。
                 // 2026-09-29：驻留方式从「外壳退出、交给托盘」改成「外壳活着、只把窗口藏起来」。
@@ -3277,6 +3631,13 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     if (WindowState == FormWindowState.Minimized) WindowState = FormWindowState.Normal;
                     Activate();
                     BringToFront();
+                    // 刚点过托盘「退出 DSH」又很快唤回时，引擎已经不在了，唤起的会是退出那一刻的
+                    // 断线页面。这里把引擎拉起来并重载页面，不停在旧界面上。
+                    if (!Program.PortOpen())
+                    {
+                        Program.StartServer();
+                        NavigateWithRetry("重新连接");
+                    }
                 }
                 catch
                 {
@@ -3285,6 +3646,79 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
 
             protected override void WndProc(ref Message m)
             {
+                // 自绘标题栏：窗口保留 WS_CAPTION，caption 的高度在这里抹成 0。
+                // 先让系统按标准窗口算一次非客户区，再把客户区顶边提到窗口顶（caption 那行消失、
+                // 左右底边框留下，边缘拖拽归系统）；最大化时客户区按窗口所在显示器的工作区夹一次。
+                if (m.Msg == Program.WM_NCCALCSIZE && m.WParam != IntPtr.Zero)
+                {
+                    base.WndProc(ref m);
+                    try
+                    {
+                        Program.NcCalcSizeParams ncp = (Program.NcCalcSizeParams)Marshal.PtrToStructure(m.LParam, typeof(Program.NcCalcSizeParams));
+                        Program.NRect target = ncp.rgrc0;
+                        bool ok = false;
+                        if (Program.IsZoomed(Handle))
+                        {
+                            IntPtr mon = Program.MonitorFromWindow(Handle, Program.MONITOR_DEFAULTTONEAREST);
+                            Program.MonitorInfo mi = new Program.MonitorInfo();
+                            mi.cbSize = Marshal.SizeOf(typeof(Program.MonitorInfo));
+                            if (Program.GetMonitorInfo(mon, ref mi))
+                            {
+                                target = mi.rcWork;
+                                ok = true;
+                            }
+                        }
+                        else
+                        {
+                            Program.NRect wr;
+                            if (Program.GetWindowRect(Handle, out wr))
+                            {
+                                target.top = wr.top;
+                                ok = true;
+                            }
+                        }
+                        if (ok)
+                        {
+                            ncp.rgrc0 = target;
+                            Marshal.StructureToPtr(ncp, m.LParam, false);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                    m.Result = IntPtr.Zero;
+                    return;
+                }
+                // 自绘标题栏（子控件）已经报 HTMAXBUTTON，这里兜一手：命中测试万一落到窗体自己身上也认
+                if (m.Msg == Program.WM_NCHITTEST && _titleBar != null && _titleBar.Visible)
+                {
+                    int lp = m.LParam.ToInt32();
+                    Point screen = new Point((short)(lp & 0xFFFF), (short)((lp >> 16) & 0xFFFF));
+                    if (_titleBar.OverMaxButton(_titleBar.PointToClient(screen)))
+                    {
+                        m.Result = (IntPtr)Program.HTMAXBUTTON;
+                        return;
+                    }
+                }
+                // 报过 HTMAXBUTTON 之后点击变成非客户区消息：谁收到谁翻一次窗口状态，别再落回系统翻第二次
+                if (m.Msg == Program.WM_NCLBUTTONDOWN && m.WParam.ToInt32() == Program.HTMAXBUTTON)
+                {
+                    TitleBar.ToggleMaximize(this);
+                    m.Result = IntPtr.Zero;
+                    return;
+                }
+                // 报过 HTMAXBUTTON 之后鼠标算非客户区：把悬停喂回标题栏，
+                // 否则那颗键的悬停底色与贴边菜单会一闪一闪。
+                if (m.Msg == Program.WM_NCMOUSEMOVE && _titleBar != null)
+                {
+                    int lp2 = m.LParam.ToInt32();
+                    Point screen2 = new Point((short)(lp2 & 0xFFFF), (short)((lp2 >> 16) & 0xFFFF));
+                    _titleBar.NcHover(_titleBar.PointToClient(screen2));
+                }
+                else if (m.Msg == Program.WM_NCMOUSELEAVE && _titleBar != null)
+                {
+                    _titleBar.NcHover(_titleBar.PointToClient(Cursor.Position));
+                }
                 // 没有 WS_CAPTION 的窗口，系统默认把「最大化」算成整块屏幕，任务栏会被盖住。
                 // 这里按当前显示器的工作区夹一次，最大化就停在任务栏上方。
                 if (m.Msg == Program.WM_GETMINMAXINFO)
@@ -3339,6 +3773,60 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 base.WndProc(ref m);
             }
 
+            /// <summary>主界面右键菜单：内核默认那份整份换掉（新建会话 / 重新加载界面 / 复制 / 粘贴 / 全选 / 开发者工具）。</summary>
+            private void MainContextMenu(object sender, CoreWebView2ContextMenuRequestedEventArgs e)
+            {
+                try
+                {
+                    CoreWebView2 core = null;
+                    try { core = web == null ? null : web.CoreWebView2; } catch { }
+                    if (core == null) return;
+                    CoreWebView2Environment env = core.Environment;
+                    CoreWebView2ContextMenuTarget target = e.ContextMenuTarget;
+                    bool editable = target != null && target.IsEditable;
+                    bool hasText = target != null && target.HasSelection;
+                    e.MenuItems.Clear();
+                    e.MenuItems.Add(EmbedMenuItem(env, "新建会话", true, MainNewSession));
+                    e.MenuItems.Add(EmbedSeparator(env));
+                    e.MenuItems.Add(EmbedMenuItem(env, "重新加载界面", true, delegate { try { core.Reload(); } catch { } }));
+                    e.MenuItems.Add(EmbedSeparator(env));
+                    e.MenuItems.Add(EmbedMenuItem(env, "复制", hasText, delegate { if (target != null) EmbedCopy(target.SelectionText); }));
+                    e.MenuItems.Add(EmbedMenuItem(env, "粘贴", editable && Clipboard.ContainsText(), MainPaste));
+                    e.MenuItems.Add(EmbedMenuItem(env, "全选", true, delegate { MainScript("document.execCommand('selectAll')"); }));
+                    e.MenuItems.Add(EmbedSeparator(env));
+                    e.MenuItems.Add(EmbedMenuItem(env, "开发者工具", true, delegate { try { core.OpenDevToolsWindow(); } catch { } }));
+                }
+                catch
+                {
+                }
+            }
+
+            private void MainScript(string js)
+            {
+                try { if (web != null && web.CoreWebView2 != null) web.CoreWebView2.ExecuteScriptAsync(js); } catch { }
+            }
+
+            /// <summary>新建会话：点页面上那个 aria-label 为「新建会话」且可见的按钮。</summary>
+            private void MainNewSession()
+            {
+                MainScript("(function(){try{var els=document.querySelectorAll('[aria-label],button,[role=button]');"
+                    + "for(var i=0;i<els.length;i++){var s=els[i].getAttribute('aria-label')||els[i].getAttribute('title')||'';"
+                    + "if(s==='新建会话'&&els[i].getClientRects().length){els[i].click();return;}}}catch(e){}})()");
+            }
+
+            /// <summary>粘贴：右键点在输入框里，把剪贴板文字塞回当前焦点元素。</summary>
+            private void MainPaste()
+            {
+                string text = "";
+                try { if (Clipboard.ContainsText()) text = Clipboard.GetText(); } catch { }
+                if (string.IsNullOrEmpty(text)) return;
+                MainScript("(function(t){var el=document.activeElement;if(!el)return;"
+                    + "if(el.isContentEditable){document.execCommand('insertText',false,t);return;}"
+                    + "if(el.tagName==='INPUT'||el.tagName==='TEXTAREA'){var s=el.selectionStart,e=el.selectionEnd,v=el.value;"
+                    + "el.value=v.slice(0,s)+t+v.slice(e);el.selectionStart=el.selectionEnd=s+t.length;"
+                    + "el.dispatchEvent(new Event('input',{bubbles:true}));}})(" + new JavaScriptSerializer().Serialize(text) + ")");
+            }
+
             private async void OnShown(object sender, EventArgs e)
             {
                 if (WindowState == FormWindowState.Minimized)
@@ -3371,6 +3859,8 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                         HideSplash();
                     }
                     await web.EnsureCoreWebView2Async(mainEnv);
+                    // 主视图建好就把自己插到了最前，片头得当场压回去
+                    SplashHold();
                 }
                 catch (Exception ex)
                 {
@@ -3381,6 +3871,16 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                 try
                 {
                     web.CoreWebView2.Settings.IsStatusBarEnabled = false;
+                    // Ctrl+滚轮 / Ctrl+加减 不再缩放界面（其余快捷键照旧，不动 AreBrowserAcceleratorKeysEnabled）
+                    web.CoreWebView2.Settings.IsZoomControlEnabled = false;
+                }
+                catch
+                {
+                }
+                try
+                {
+                    // 右键交给自己的菜单：内核默认那份在 MainContextMenu 里整份换掉
+                    web.CoreWebView2.ContextMenuRequested += MainContextMenu;
                 }
                 catch
                 {
@@ -3454,12 +3954,6 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
                     });
                 }
 
-                // 确保 WiFi 代理在跑（供手机局域网访问），不管 DSH 是否本次启动
-                if (!Program.ProxyOpen())
-                {
-                    Program.StartProxy();
-                }
-
                 if (Program.PortOpen())
                 {
                     Text = "DeepSeek Harness";
@@ -3480,24 +3974,111 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
             }
         }
 
-        /// <summary>关闭询问窗的绘制基件：无锯齿圆角矩形。</summary>
-        internal static class DialogUi
+        /// <summary>外壳配色 token：深/浅两套，自绘控件一律从这里取色——换主题色只改这一处。</summary>
+        internal static class ShellPalette
         {
-            // 配色（浅色卡片）
-            internal static readonly Color CBg = Color.FromArgb(0xF5, 0xF6, 0xF8);
-            internal static readonly Color CText = Color.FromArgb(0x1A, 0x1A, 0x1A);
-            internal static readonly Color CSub = Color.FromArgb(0x6B, 0x6F, 0x76);
-            internal static readonly Color CLine = Color.FromArgb(0xE2, 0xE5, 0xEA);
-            internal static readonly Color CAccent = Color.FromArgb(0x4D, 0x6B, 0xFE);
-            internal static readonly Color CAccentSoft = Color.FromArgb(0xF2, 0xF5, 0xFF);
-            internal static readonly Color CAccentBorder = Color.FromArgb(0x4D, 0x6B, 0xFE);
-            internal static readonly Color CGrayIcon = Color.FromArgb(0x8A, 0x90, 0x99);
-            internal static readonly Color CDanger = Color.FromArgb(0xD9, 0x4A, 0x4A);
+            internal static bool Dark = true;
 
+            internal static void Set(bool dark) { Dark = dark; }
+
+            internal static Color Surface
+            {
+                get { return Dark ? Color.FromArgb(0x15, 0x15, 0x17) : Color.FromArgb(0xF3, 0xF4, 0xF6); }
+            }
+
+            internal static Color SurfaceAlt
+            {
+                get { return Dark ? Color.FromArgb(0x1E, 0x20, 0x24) : Color.FromArgb(0xFF, 0xFF, 0xFF); }
+            }
+
+            internal static Color Text
+            {
+                get { return Dark ? Color.FromArgb(0xE6, 0xE9, 0xEF) : Color.FromArgb(0x1F, 0x23, 0x28); }
+            }
+
+            internal static Color TextDim
+            {
+                get { return Dark ? Color.FromArgb(0x8A, 0x92, 0xA0) : Color.FromArgb(0x6B, 0x72, 0x80); }
+            }
+
+            internal static Color TextMute
+            {
+                get { return Dark ? Color.FromArgb(0x99, 0x9F, 0xA9) : Color.FromArgb(0x6B, 0x72, 0x80); }
+            }
+
+            internal static Color Line
+            {
+                get { return Dark ? Color.FromArgb(0x2A, 0x2E, 0x36) : Color.FromArgb(0xD8, 0xDC, 0xE0); }
+            }
+
+            /// <summary>悬停底色（纯 RGB）：alpha 由 HoverAlpha 按过渡进度补，别直接拿来画。</summary>
+            internal static Color HoverFill
+            {
+                get { return Dark ? Color.FromArgb(0xFF, 0xFF, 0xFF) : Color.FromArgb(0x00, 0x00, 0x00); }
+            }
+
+            internal static int HoverAlpha { get { return Dark ? 0x18 : 0x14; } }
+
+            internal static readonly Color Accent = Color.FromArgb(0x6F, 0xA8, 0xFF);
+            internal static readonly Color AccentDim = Color.FromArgb(0x3F, 0x6B, 0xC8);
+            internal static readonly Color CloseHot = Color.FromArgb(0xC4, 0x2B, 0x1C);
+        }
+
+        /// <summary>按真实时间走的动画时钟：掉帧时动画只是跳帧，不会变慢（旧写法是每帧加固定量）。</summary>
+        internal sealed class AnimClock
+        {
+            private readonly Stopwatch _sw = new Stopwatch();
+
+            internal void Restart() { _sw.Restart(); }
+
+            /// <summary>已过毫秒数。</summary>
+            internal double Ms { get { return _sw.Elapsed.TotalMilliseconds; } }
+
+            /// <summary>0..1 的进度，超过时长封顶到 1。</summary>
+            internal double T(double ms)
+            {
+                if (ms <= 0.0) return 1.0;
+                double t = _sw.Elapsed.TotalMilliseconds / ms;
+                if (t < 0.0) return 0.0;
+                if (t > 1.0) return 1.0;
+                return t;
+            }
+        }
+
+        internal static class Ease
+        {
+            internal static double OutCubic(double t)
+            {
+                double u = 1.0 - t;
+                return 1.0 - u * u * u;
+            }
+
+            internal static Color Blend(Color a, Color b, double t)
+            {
+                if (t <= 0.0) return a;
+                if (t >= 1.0) return b;
+                return Color.FromArgb(
+                    (int)Math.Round(a.A + (b.A - a.A) * t),
+                    (int)Math.Round(a.R + (b.R - a.R) * t),
+                    (int)Math.Round(a.G + (b.G - a.G) * t),
+                    (int)Math.Round(a.B + (b.B - a.B) * t));
+            }
+
+            internal static Color Alpha(Color c, double t)
+            {
+                double a = t < 0.0 ? 0.0 : (t > 1.0 ? 1.0 : t);
+                return Color.FromArgb((int)Math.Round(255.0 * a), c);
+            }
+        }
+
+        /// <summary>圆角矩形绘制基件（无锯齿）。</summary>
+        internal static class ShellDraw
+        {
             internal static GraphicsPath Round(Rectangle r, int radius)
             {
-                int d = Math.Max(2, Math.Min(radius * 2, Math.Min(r.Width, r.Height)));
                 GraphicsPath p = new GraphicsPath();
+                if (r.Width <= 0 || r.Height <= 0) return p;
+                int d = Math.Max(1, Math.Min(radius, Math.Min(r.Width, r.Height)));
                 p.AddArc(r.X, r.Y, d, d, 180, 90);
                 p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
                 p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
@@ -3509,465 +4090,21 @@ document.addEventListener('keydown',function(e){if(e.key==='Escape')chrome.webvi
             internal static void Fill(Graphics g, Rectangle r, int radius, Color c)
             {
                 using (GraphicsPath p = Round(r, radius))
-                using (SolidBrush b = new SolidBrush(c)) g.FillPath(b, p);
+                using (SolidBrush b = new SolidBrush(c))
+                {
+                    g.FillPath(b, p);
+                }
             }
 
             internal static void Stroke(Graphics g, Rectangle r, int radius, Color c, float w)
             {
                 using (GraphicsPath p = Round(r, radius))
-                using (Pen pen = new Pen(c, w)) g.DrawPath(pen, p);
-            }
-
-            internal static void Circle(Graphics g, Rectangle r, Color fill, Color stroke, float sw)
-            {
-                if (fill.A > 0)
+                using (Pen pen = new Pen(c, w))
                 {
-                    using (SolidBrush b = new SolidBrush(fill)) g.FillEllipse(b, r);
-                }
-                if (stroke.A > 0 && sw > 0)
-                {
-                    using (Pen p = new Pen(stroke, sw)) g.DrawEllipse(p, r);
+                    g.DrawPath(pen, p);
                 }
             }
         }
 
-        /// <summary>外层假透明面板：画一圈柔和的投影，再交回自定义绘制。</summary>
-        private sealed class DialogRoundPanel : Panel
-        {
-            private readonly int _radius = 12;
-            private readonly Color _fill = Color.Transparent;
-            private readonly Color _line = Color.Empty;
-
-            internal DialogRoundPanel(Color fill, Color line, int radius)
-            {
-                _fill = fill;
-                _line = line;
-                _radius = Math.Max(2, radius);
-                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
-                    | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
-                BackColor = Color.Transparent;
-            }
-
-            protected override void OnPaintBackground(PaintEventArgs e)
-            {
-                if (_fill == Color.Transparent) return; // 假透明：不擦底，圆角外由父层负责
-                Rectangle r = new Rectangle(0, 0, Width - 1, Height - 1);
-                if (_line != Color.Empty) DialogUi.Fill(e.Graphics, r, _radius, _line);
-                Rectangle inner = new Rectangle(r.X + 1, r.Y + 1, r.Width - 2, r.Height - 2);
-                DialogUi.Fill(e.Graphics, inner, Math.Max(2, _radius - 1), _fill);
-            }
-        }
-
-        /// <summary>可点击的选项卡片：圆角、图标、标题、说明、可选角标。</summary>
-        private sealed class DialogCard : Control
-        {
-            private readonly string _title, _desc, _tag;
-            private readonly bool _primary, _danger;
-            private readonly Font _fT, _fD, _fTag;
-            private bool _hover;
-
-            internal DialogCard(bool primary, string title, string desc, string tag,
-                Font fT, Font fD, Font fTag, bool danger)
-            {
-                _primary = primary;
-                _title = title;
-                _desc = desc;
-                _tag = tag;
-                _fT = fT;
-                _fD = fD;
-                _fTag = fTag;
-                _danger = danger;
-                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
-                    | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
-                BackColor = Color.Transparent;
-                Cursor = Cursors.Hand;
-            }
-
-            protected override void OnPaintBackground(PaintEventArgs e)
-            {
-                // 由 OnPaint 统一绘制
-            }
-
-            protected override void OnPaint(PaintEventArgs e)
-            {
-                Graphics g = e.Graphics;
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-
-                // 局部坐标：矩形内缩 1px，让描边完整可见
-                Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
-                int rad = Math.Max(6, (int)Math.Round(11 * (Width / 442f)));
-
-                Color accent = _danger ? DialogUi.CDanger : DialogUi.CAccent;
-                Color bg, border;
-                if (_primary)
-                {
-                    bg = _hover ? Color.FromArgb(0xE8, 0xEF, 0xFF) : DialogUi.CAccentSoft;
-                    border = _hover ? accent : DialogUi.CAccentBorder;
-                }
-                else
-                {
-                    bg = _hover ? (_danger ? Color.FromArgb(0xFD, 0xF2, 0xF2) : Color.FromArgb(0xF7, 0xF8, 0xFA))
-                                : Color.FromArgb(0xFB, 0xFC, 0xFD);
-                    border = _hover ? accent : DialogUi.CLine;
-                }
-                DialogUi.Fill(g, r, rad, bg);
-                DialogUi.Stroke(g, r, rad, border, _hover ? 2f : 1f);
-
-                int pad = Math.Max(10, (int)Math.Round(r.Height * 0.23));
-                int icon = Math.Max(28, (int)Math.Round(r.Height * 0.5));
-                int iy = r.Y + (r.Height - icon) / 2;
-                Rectangle ic = new Rectangle(r.X + pad, iy, icon, icon);
-
-                Color iconBg = _primary ? (_danger ? Color.FromArgb(0xFF, 0xE9, 0xE9) : Color.FromArgb(0xE4, 0xEB, 0xFF))
-                                        : (_hover && _danger ? Color.FromArgb(0xFF, 0xE4, 0xE4) : Color.FromArgb(0xF0, 0xF1, 0xF4));
-                Color iconFg = _primary || _hover ? accent : DialogUi.CGrayIcon;
-                DialogUi.Circle(g, ic, iconBg, Color.Empty, 0);
-
-                float gy = icon * 0.3f;
-                float gx = icon * 0.5f;
-                using (Pen pen = new Pen(iconFg, Math.Max(1.6f, icon * 0.075f)))
-                {
-                    pen.StartCap = LineCap.Round;
-                    pen.EndCap = LineCap.Round;
-                    pen.LineJoin = LineJoin.Round;
-                    float cx = ic.X + gx;
-                    if (_primary)
-                    {
-                        // 托盘图标：向下箭头 + 底托
-                        g.DrawLine(pen, cx, ic.Y + gy, cx, ic.Y + icon - gy * 1.15f);
-                        g.DrawLine(pen, cx - gx * 0.55f, ic.Y + icon - gy * 1.75f, cx, ic.Y + icon - gy * 1.15f);
-                        g.DrawLine(pen, cx + gx * 0.55f, ic.Y + icon - gy * 1.75f, cx, ic.Y + icon - gy * 1.15f);
-                        g.DrawLine(pen, cx - gx * 0.62f, ic.Y + icon - gy * 0.55f, cx + gx * 0.62f, ic.Y + icon - gy * 0.55f);
-                    }
-                    else
-                    {
-                        // 关闭图标：×
-                        float k = gx * 0.52f;
-                        float cy = ic.Y + icon * 0.5f;
-                        g.DrawLine(pen, cx - k, cy - k, cx + k, cy + k);
-                        g.DrawLine(pen, cx + k, cy - k, cx - k, cy + k);
-                    }
-                }
-
-                int tx = ic.Right + pad;
-                int avail = r.Right - pad - tx;
-                Size ts = TextRenderer.MeasureText(_title, _fT);
-                int tagW = 0;
-                if (!string.IsNullOrEmpty(_tag))
-                {
-                    Size gs = TextRenderer.MeasureText(_tag, _fTag);
-                    tagW = gs.Width + Math.Max(10, (int)(pad * 0.5));
-                    avail -= tagW + 8;
-                }
-                int dh = TextRenderer.MeasureText(_desc, _fD,
-                    new Size(Math.Max(40, avail), 1000), TextFormatFlags.WordBreak).Height;
-                int textH = ts.Height + 4 + dh;
-                int ty = r.Y + (r.Height - textH) / 2;
-
-                TextRenderer.DrawText(g, _title, _fT, new Point(tx, ty), DialogUi.CText,
-                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine);
-
-                if (tagW > 0)
-                {
-                    int th = Math.Max(16, ts.Height - 2);
-                    Rectangle tr = new Rectangle(r.Right - pad - tagW, ty + (ts.Height - th) / 2, tagW, th);
-                    Color tagBg = _danger ? Color.FromArgb(0xFF, 0xF0, 0xF0) : Color.FromArgb(0xE4, 0xEB, 0xFF);
-                    Color tagFg = _danger ? DialogUi.CDanger : DialogUi.CAccent;
-                    DialogUi.Fill(g, tr, th / 2, tagBg);
-                    TextRenderer.DrawText(g, _tag, _fTag, tr, tagFg,
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
-                }
-
-                TextRenderer.DrawText(g, _desc, _fD,
-                    new Rectangle(tx, ty + ts.Height + 4, Math.Max(40, avail + (tagW > 0 ? tagW + 8 : 0)), dh), DialogUi.CSub,
-                    TextFormatFlags.WordBreak | TextFormatFlags.NoPadding);
-
-                g.SmoothingMode = SmoothingMode.None;
-            }
-
-            protected override void OnMouseEnter(EventArgs e)
-            {
-                base.OnMouseEnter(e);
-                _hover = true;
-                Invalidate();
-            }
-
-            protected override void OnMouseLeave(EventArgs e)
-            {
-                base.OnMouseLeave(e);
-                _hover = false;
-                Invalidate();
-            }
-
-            protected override void OnMouseDown(MouseEventArgs e)
-            {
-                base.OnMouseDown(e);
-                OnClick(EventArgs.Empty);
-            }
-        }
-
-        /// <summary>胶囊按钮：主色 / 描边两种外观。</summary>
-        private sealed class DialogPillButton : Control
-        {
-            private readonly string _text;
-            private readonly bool _primary;
-            private readonly Font _font;
-            private bool _hover;
-
-            internal DialogPillButton(string text, bool primary, Font font, bool disabled)
-            {
-                _text = text;
-                _primary = primary;
-                _font = font;
-                Enabled = !disabled;
-                SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint
-                    | ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor, true);
-                BackColor = Color.Transparent;
-                Cursor = Cursors.Hand;
-            }
-
-            protected override void OnPaintBackground(PaintEventArgs e)
-            {
-            }
-
-            protected override void OnPaint(PaintEventArgs e)
-            {
-                Graphics g = e.Graphics;
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
-                Rectangle r = new Rectangle(1, 1, Width - 3, Height - 3);
-                int rad = Math.Max(6, r.Height / 2);
-
-                Color bg, border, fg;
-                if (_primary)
-                {
-                    bg = _hover ? Color.FromArgb(0x3F, 0x5A, 0xE0) : DialogUi.CAccent;
-                    border = bg;
-                    fg = Color.White;
-                }
-                else
-                {
-                    bg = _hover ? Color.FromArgb(0xEF, 0xF1, 0xF5) : Color.White;
-                    border = _hover ? Color.FromArgb(0xC9, 0xCE, 0xD6) : DialogUi.CLine;
-                    fg = DialogUi.CText;
-                }
-                if (!Enabled)
-                {
-                    bg = Color.FromArgb(0xF2, 0xF3, 0xF5);
-                    border = DialogUi.CLine;
-                    fg = Color.FromArgb(0xA8, 0xAD, 0xB5);
-                }
-                DialogUi.Fill(g, r, rad, bg);
-                DialogUi.Stroke(g, r, rad, border, 1f);
-                TextRenderer.DrawText(g, _text, _font, r, fg,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter
-                    | TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
-                g.SmoothingMode = SmoothingMode.None;
-            }
-
-            protected override void OnMouseEnter(EventArgs e)
-            {
-                base.OnMouseEnter(e);
-                _hover = true;
-                Invalidate();
-            }
-
-            protected override void OnMouseLeave(EventArgs e)
-            {
-                base.OnMouseLeave(e);
-                _hover = false;
-                Invalidate();
-            }
-
-            protected override void OnMouseDown(MouseEventArgs e)
-            {
-                base.OnMouseDown(e);
-                OnClick(EventArgs.Empty);
-            }
-        }
-
-        /// <summary>关闭方式询问小窗：返回 0=最小化到托盘，1=彻底关闭，-1=取消。</summary>
-        private sealed class CloseDialog : Form
-        {
-            private int _choice = -1;
-
-            public static int Ask(IWin32Window owner)
-            {
-                using (CloseDialog dlg = new CloseDialog())
-                {
-                    dlg.ShowDialog(owner);
-                    return dlg._choice;
-                }
-            }
-
-            /// <summary>仅供 --preview-close-dialog 调试：独立展示关闭询问窗。</summary>
-            internal static CloseDialog Preview()
-            {
-                CloseDialog dlg = new CloseDialog();
-                dlg.StartPosition = FormStartPosition.CenterScreen;
-                return dlg;
-            }
-
-            /// <summary>自截图：用窗口内容区的实际矩形截图，避免外部坐标系被 DPI 虚拟化干扰。</summary>
-            internal static void SaveShot(Form f, string path)
-            {
-                try
-                {
-                    f.Refresh();
-                    // 稳定优先：只截窗口在屏幕上的位置（WinForms 自报坐标，与自身渲染同一坐标系）
-                    Rectangle r = new Rectangle(
-                        f.Left + 8, f.Top + 8, Math.Max(40, f.Width - 16), Math.Max(40, f.Height - 16));
-                    using (Bitmap bmp = new Bitmap(r.Width, r.Height))
-                    {
-                        using (Graphics g = Graphics.FromImage(bmp))
-                        {
-                            g.CopyFromScreen(r.Left, r.Top, 0, 0, new Size(r.Width, r.Height));
-                        }
-                        bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
-                    }
-                    File.WriteAllText(path + ".txt",
-                        "form=" + f.Left + "," + f.Top + "," + f.Width + "," + f.Height
-                        + " dpi=" + f.DeviceDpi + " U=" + ((double)f.Width / 470.0).ToString("0.###"));
-                }
-                catch (Exception ex)
-                {
-                    try { File.WriteAllText(path + ".err", ex.ToString()); } catch { }
-                }
-            }
-
-            // ── 配色（深色标题 / 浅色卡片）─────────────────────────────
-
-            private readonly float U; // 统一缩放：0.75 × (当前 DPI / 96) → 96DPI 下正好是原尺寸的 1.5 倍
-
-            private readonly Font _fTitle, _fSub, _fCardT, _fCardD, _fTag, _fBtn;
-            private readonly DialogRoundPanel _shadow;
-            private readonly DialogCard _card0, _card1;
-
-            private CloseDialog()
-            {
-                using (Graphics g = CreateGraphics()) U = 0.75f * (g.DpiX / 96f);
-                if (U < 0.5f) U = 0.5f;
-
-                Text = "关闭 DeepSeek Harness";
-                FormBorderStyle = FormBorderStyle.None;
-                StartPosition = FormStartPosition.CenterParent;
-                MaximizeBox = false;
-                MinimizeBox = false;
-                ShowInTaskbar = false;
-                AutoScaleMode = AutoScaleMode.None;
-                BackColor = DialogUi.CBg;
-                KeyPreview = true; // ESC 取消
-
-                _fTitle = new Font("Microsoft YaHei UI", 11.25f * U, FontStyle.Bold);
-                _fSub = new Font("Microsoft YaHei UI", 9f * U, FontStyle.Regular);
-                _fCardT = new Font("Microsoft YaHei UI", 10.5f * U, FontStyle.Bold);
-                _fCardD = new Font("Microsoft YaHei UI", 8.25f * U, FontStyle.Regular);
-                _fTag = new Font("Microsoft YaHei UI", 7.5f * U, FontStyle.Bold);
-                _fBtn = new Font("Microsoft YaHei UI", 9f * U, FontStyle.Regular);
-
-                int W = Math.Max(430, (int)Math.Round(470 * U));
-                int H = Math.Max(300, (int)Math.Round(212 * U));
-                int shad = (int)Math.Round(10 * U);
-                int inPad = (int)Math.Round(26 * U);
-
-                // 卡片外圈：柔和投影
-                _shadow = new DialogRoundPanel(Color.Transparent, Color.Empty, (int)Math.Round(16 * U));
-                _shadow.SetBounds(shad, shad, W - shad * 2, H - shad * 2);
-                _shadow.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
-                Controls.Add(_shadow);
-
-                // 卡片内层：白底圆角 + 1px 描边
-                DialogRoundPanel card = new DialogRoundPanel(Color.White, DialogUi.CLine, (int)Math.Round(13 * U));
-                card.SetBounds(shad, shad, W - shad * 4, H - shad * 4);
-                card.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right | AnchorStyles.Bottom;
-                _shadow.Controls.Add(card);
-                int cw = card.Width - inPad * 2;
-
-                Label title = new Label();
-                title.Text = "关闭页面后？";
-                title.Font = _fTitle;
-                title.ForeColor = DialogUi.CText;
-                title.BackColor = Color.Transparent;
-                title.AutoSize = false;
-                title.SetBounds(inPad, (int)Math.Round(18 * U), cw, (int)Math.Round(32 * U));
-                title.MouseDown += delegate(object s, MouseEventArgs e) { DragWindow(); };
-                card.Controls.Add(title);
-
-                int cardH = (int)Math.Round(84 * U);
-                int gap = (int)Math.Round(12 * U);
-                int row0 = (int)Math.Round(56 * U);
-
-                _card0 = new DialogCard(true, "最小化到托盘",
-                    "引擎与手机访问留在后台，双击托盘图标唤回",
-                    "推荐", _fCardT, _fCardD, _fTag, false);
-                _card0.SetBounds(inPad, row0, cw, cardH);
-                _card0.Click += delegate { _choice = 0; Close(); };
-                card.Controls.Add(_card0);
-
-                _card1 = new DialogCard(false, "彻底关闭",
-                    "页面与后台服务全部退出",
-                    null, _fCardT, _fCardD, _fTag, true);
-                _card1.SetBounds(inPad, row0 + cardH + gap, cw, cardH);
-                _card1.Click += delegate { _choice = 1; Close(); };
-                card.Controls.Add(_card1);
-
-                DialogPillButton cancel = new DialogPillButton("取消", false, _fBtn, false);
-                cancel.SetBounds(card.Width - inPad - (int)Math.Round(124 * U),
-                    row0 + cardH * 2 + gap + (int)Math.Round(8 * U),
-                    (int)Math.Round(124 * U), (int)Math.Round(40 * U));
-                cancel.Anchor = AnchorStyles.Right | AnchorStyles.Bottom;
-                cancel.Click += delegate { _choice = -1; Close(); };
-                card.Controls.Add(cancel);
-
-                ClientSize = new Size(W, H);
-
-                AcceptButton = null;
-                KeyDown += delegate(object s, KeyEventArgs e)
-                {
-                    if (e.KeyCode == Keys.Escape)
-                    {
-                        _choice = -1;
-                        Close();
-                    }
-                    else if (e.KeyCode == Keys.Enter)
-                    {
-                        _choice = 0; // Enter＝最小化到托盘（安全默认）
-                        Close();
-                    }
-                    else if (e.KeyCode == Keys.D1 || e.KeyCode == Keys.NumPad1)
-                    {
-                        _choice = 0; Close();
-                    }
-                    else if (e.KeyCode == Keys.D2 || e.KeyCode == Keys.NumPad2)
-                    {
-                        _choice = 1; Close();
-                    }
-                };
-            }
-
-            /// <summary>按住卡片空白处拖动窗口（无边框窗体）。</summary>
-            private void DragWindow()
-            {
-                ReleaseCapture();
-                SendMessage(Handle, WM_NCLBUTTONDOWN, (IntPtr)HTCAPTION, IntPtr.Zero);
-            }
-
-            protected override void OnHandleCreated(EventArgs e)
-            {
-                base.OnHandleCreated(e);
-                // Win11：请系统给无边框窗体加圆角 + 投影
-                try
-                {
-                    int pref = 2; // DWMWCP_ROUND
-                    DwmSetWindowAttribute(Handle, 33, ref pref, 4);
-                    int shadow = 2;
-                    DwmSetWindowAttribute(Handle, 2, ref shadow, 4);
-                }
-                catch
-                {
-                }
-            }
-        }
     }
 }
